@@ -153,8 +153,8 @@ values.
   origin or downgraded from `https` to `http`.
 - `/reset`, `/new` and `/undo` invalidate a search still in flight for that session: it is not
   interrupted and may finish its HTTP request, but its pointers are never published, and a new
-  search can start at once. Shutdown stops any running search from publishing pointers or caching
-  a token. A token minted by a search that a reset invalidated is still cached for the profile,
+  search can start at once. Shutdown is final: it stops any running search from publishing
+  pointers or caching a token, and the instance does no further work. A token minted by a search that a reset invalidated is still cached for the profile,
   because a minted token belongs to the profile's credential, not to one session.
 - The text of your messages is never logged. The only log line is a debug-level exception class name.
 - Page titles come from your brain and can contain anything. They are reduced to one line, capped

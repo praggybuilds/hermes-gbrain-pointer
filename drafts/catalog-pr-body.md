@@ -75,8 +75,8 @@ and the plugin never writes to GBrain.
   timeouts of 3 s for `/token` and 12 s for search. The plugin tracks one current-generation search
   per profile and session. Reset and rewind start a new generation without stopping the old
   worker: an invalidated worker may keep running until its own timeout but cannot publish, so two
-  workers for one session can briefly overlap. Shutdown likewise blocks publication and token
-  caching; it does not cancel a request already sent. No long-running processes.
+  workers for one session can briefly overlap. Shutdown is final: it blocks publication and token
+  caching, later calls do nothing, and it does not cancel a request already sent. No long-running processes.
 - **Telemetry.** None.
 - **Logging.** The text of user messages is never logged. On failure it logs only the exception
   class name, at debug level.
@@ -120,7 +120,7 @@ and the plugin never writes to GBrain.
 Validation passed.
 ```
 
-The repository's offline test suite (`tests/`, 61 tests, a stub `/token` + `/mcp` server
+The repository's offline test suite (`tests/`, 62 tests, a stub `/token` + `/mcp` server
 on `127.0.0.1`) covers:
 
 - unavailable without credentials

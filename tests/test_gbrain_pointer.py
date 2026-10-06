@@ -398,14 +398,17 @@ class GBrainPointerTests(unittest.TestCase):
         proxy_url = f"http://127.0.0.1:{proxy.server_address[1]}"
         saved = {k: os.environ.pop(k) for k in list(os.environ)
                  if k.lower() in ("http_proxy", "https_proxy", "no_proxy", "all_proxy")}
-        os.environ["http_proxy"] = os.environ["HTTP_PROXY"] = proxy_url
+        proxy_vars = ("http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY")
+        for k in proxy_vars:
+            os.environ[k] = proxy_url
         try:
             fresh = _load_plugin()  # the opener is built at import time
             provider = fresh.GBrainPointerMemoryProvider()
             with scope(self.creds_a):
                 text = run_turn(provider, "alpha project status")
         finally:
-            for k in ("http_proxy", "HTTP_PROXY"):
+            sys.modules[gp.__name__] = gp  # the fresh load replaced the registry entry
+            for k in proxy_vars:
                 os.environ.pop(k, None)
             os.environ.update(saved)
             proxy.shutdown()
@@ -811,8 +814,8 @@ class ReviewFindingTests(unittest.TestCase):
             self.provider.shutdown()
             release.set()
             join_all(workers)
-            self.assertEqual(self.provider.prefetch("alpha project status", session_id="s1"), "")
-            self.provider.initialize("s1")
+            # Checked directly: prefetch() also refuses after shutdown and would mask this guard.
+            self.assertEqual(self.provider._cached, {}, "a search finishing after shutdown must not publish")
             self.assertEqual(self.provider.prefetch("alpha project status", session_id="s1"), "")
 
     def test_f5_shutdown_blocks_token_caching(self):
@@ -825,9 +828,19 @@ class ReviewFindingTests(unittest.TestCase):
             release.set()
             join_all(workers)
             self.stub.token_gate = None
+        self.assertEqual(self.provider._minted, {}, "a token minted across shutdown must not be cached")
+        self.assertEqual(self.stub.mint_count, 1)
+
+    def test_shutdown_is_final(self):
+        """initialize() after shutdown() does not re-open the instance (review r4 S3)."""
+        with scope(self.creds_a):
+            self.assertTrue(run_turn(self.provider, "alpha project status"))
+            self.provider.shutdown()
             self.provider.initialize("s2")
-            self.assertTrue(run_turn(self.provider, "alpha project status", session="s2"))
-        self.assertEqual(self.stub.mint_count, 2, "a token minted across shutdown must not be cached")
+            self.provider.queue_prefetch("alpha project status", session_id="s2")
+            time.sleep(0.2)
+            self.assertEqual(self.provider.prefetch("alpha project status", session_id="s2"), "")
+        self.assertEqual(len(self.stub.search_calls), 1, "no search after shutdown")
 
     def test_f5_queue_after_shutdown_does_nothing(self):
         self.provider.shutdown()

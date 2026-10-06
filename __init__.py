@@ -466,10 +466,9 @@ class GBrainPointerMemoryProvider(MemoryProvider):
         # (home_key, token_url, client_id, secret fingerprint) -> minted access token.
         # Never os.environ, so two profiles served by one process never share a token.
         self._minted: Dict[Tuple[str, str, str, str], str] = {}
-        # Shutdown closes the instance; ``epoch`` lets work started before a
-        # shutdown recognise that it must not publish or cache anything.
+        # Shutdown is final: Hermes drives one initialize -> ... -> shutdown per
+        # instance, so a closed instance never does work again.
         self._closed = False
-        self._epoch = 0
 
     # -- keys ---------------------------------------------------------------
 
@@ -491,10 +490,9 @@ class GBrainPointerMemoryProvider(MemoryProvider):
     def _session_key(settings: Settings, session_id: str) -> Tuple[str, str]:
         return (settings.home_key, str(session_id or _DEFAULT_SESSION))
 
-    def _is_current(self, key: Tuple[str, str], generation: int, epoch: int) -> bool:
+    def _is_current(self, key: Tuple[str, str], generation: int) -> bool:
         """Caller holds the lock."""
-        return (not self._closed and self._epoch == epoch
-                and self._generation.get(key, 0) == generation)
+        return not self._closed and self._generation.get(key, 0) == generation
 
     # -- identity / availability -------------------------------------------
 
@@ -517,10 +515,6 @@ class GBrainPointerMemoryProvider(MemoryProvider):
         )
 
     def initialize(self, session_id: str, **kwargs: Any) -> None:
-        # Re-opens an instance after shutdown(); work started before the shutdown
-        # still carries the old epoch and stays unable to publish.
-        with self._lock:
-            self._closed = False
         return None
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
@@ -556,7 +550,7 @@ class GBrainPointerMemoryProvider(MemoryProvider):
 
     # -- network -----------------------------------------------------------
 
-    def _mint_token(self, settings: Settings, epoch: Optional[int] = None) -> str:
+    def _mint_token(self, settings: Settings) -> str:
         if settings.auth_mode != "client":
             return ""
         body = urllib.parse.urlencode({
@@ -576,7 +570,7 @@ class GBrainPointerMemoryProvider(MemoryProvider):
         token = str(payload.get("access_token") or "") if isinstance(payload, dict) else ""
         if token:
             with self._lock:
-                if self._closed or (epoch is not None and epoch != self._epoch):
+                if self._closed:
                     return ""  # shut down meanwhile: neither cache nor use it
                 mint_key = self._mint_key(settings)
                 # A rotated secret leaves its old token unreachable; drop it too.
@@ -601,7 +595,7 @@ class GBrainPointerMemoryProvider(MemoryProvider):
             raw = _read_bounded(response, MAX_SEARCH_RESPONSE_BYTES)
         return raw.decode("utf-8", errors="replace")
 
-    def _fetch_pointers(self, query: str, settings: Settings, epoch: Optional[int] = None) -> List[str]:
+    def _fetch_pointers(self, query: str, settings: Settings) -> List[str]:
         if not settings.usable:
             return []
         # GBrain has no metadata-only search mode: ``snippet_chars`` <= 0 means FULL
@@ -629,7 +623,7 @@ class GBrainPointerMemoryProvider(MemoryProvider):
         else:
             with self._lock:
                 token = self._minted.get(self._mint_key(settings), "")
-            token = token or self._mint_token(settings, epoch)
+            token = token or self._mint_token(settings)
         if not token:
             return []
         try:
@@ -643,7 +637,7 @@ class GBrainPointerMemoryProvider(MemoryProvider):
             with self._lock:
                 if self._minted.get(self._mint_key(settings)) == token:
                     self._minted.pop(self._mint_key(settings), None)
-            token = self._mint_token(settings, epoch)
+            token = self._mint_token(settings)
             if not token:
                 return []
             try:
@@ -704,7 +698,7 @@ class GBrainPointerMemoryProvider(MemoryProvider):
         with self._lock:
             if self._closed:
                 return
-            generation, epoch = self._generation.get(key, 0), self._epoch
+            generation = self._generation.get(key, 0)
             running = self._inflight.get(key)
             if running is not None and running[0] == generation:
                 return
@@ -712,14 +706,14 @@ class GBrainPointerMemoryProvider(MemoryProvider):
 
         def _run() -> None:
             try:
-                lines = self._fetch_pointers(query, settings, epoch)
+                lines = self._fetch_pointers(query, settings)
             except Exception as exc:  # fail open (incl. ResponseTooLarge); never log the prompt
                 logger.debug("gbrain-pointer prefetch failed: %s", type(exc).__name__)
                 lines = []
             with self._lock:
                 if self._inflight.get(key, (None, None))[1] is job:
                     del self._inflight[key]
-                if not self._is_current(key, generation, epoch):
+                if not self._is_current(key, generation):
                     return  # reset, rewound or shut down meanwhile: publish nothing
                 if lines:
                     self._cached[key] = (fingerprint, tuple(lines))
@@ -766,7 +760,6 @@ class GBrainPointerMemoryProvider(MemoryProvider):
     def shutdown(self) -> None:
         with self._lock:
             self._closed = True
-            self._epoch += 1
             self._cached.clear()
             self._inflight.clear()
             self._minted.clear()
