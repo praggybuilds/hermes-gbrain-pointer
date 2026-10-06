@@ -1,0 +1,57 @@
+name: Bug report
+description: Something is not working as described in the README
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Security problem? Do not file it here. Use **Security → Report a vulnerability** instead (see SECURITY.md).
+        Never paste tokens, client secrets or private page titles.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+    validations:
+      required: true
+  - type: input
+    id: hermes
+    attributes:
+      label: Hermes Agent version
+      description: Output of `hermes --version`
+    validations:
+      required: true
+  - type: input
+    id: gbrain
+    attributes:
+      label: GBrain version
+      description: Output of `gbrain --version`
+    validations:
+      required: true
+  - type: input
+    id: plugin
+    attributes:
+      label: Plugin version or commit
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Where were you using Hermes?
+      options:
+        - CLI
+        - Desktop app
+        - Gateway (Slack, Telegram, Discord and others)
+        - Cron
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log lines (redacted)
+      render: text

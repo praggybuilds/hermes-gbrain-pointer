@@ -192,6 +192,9 @@ HERMES_AGENT_SRC=/path/to/hermes-agent python -m unittest discover -s tests -v
 hermes plugins validate .
 ```
 
+Contributions are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md). Report security problems
+privately as described in [SECURITY.md](SECURITY.md).
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
