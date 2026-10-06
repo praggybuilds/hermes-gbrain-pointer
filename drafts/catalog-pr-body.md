@@ -76,7 +76,8 @@ and the plugin never writes to GBrain.
   per profile and session. Reset and rewind start a new generation without stopping the old
   worker: an invalidated worker may keep running until its own timeout but cannot publish, so two
   workers for one session can briefly overlap. Shutdown is final: it blocks publication and token
-  caching, later calls do nothing, and it does not cancel a request already sent. No long-running processes.
+  caching, later calls do nothing, and it does not cancel a request already sent. No long-running
+  processes.
 - **Telemetry.** None.
 - **Logging.** The text of user messages is never logged. On failure it logs only the exception
   class name, at debug level.
