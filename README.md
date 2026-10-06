@@ -46,9 +46,10 @@ GBrain honours: `snippet_chars: 1`. Each returned row is GBrain's lean row: `slu
 a `chunk_text` cut to its first character plus a truncation marker, and whichever safety or
 provenance fields GBrain attaches to that row (such as `injection_suspected`, `superseded`,
 `status`, `message_id`, `thread_id` or `source_subject`). The response can also carry GBrain's
-response metadata and notice blocks. The plugin reads at most 262,144 bytes of a search response
-(16,384 bytes of a `/token` response); a body that is larger, or declares a larger
-`Content-Length`, is dropped before it is decoded or parsed, and that turn gets no pointers. Only
+response metadata and notice blocks. The plugin accepts at most 262,144 bytes of a search response
+(16,384 bytes of a `/token` response), reading at most one extra byte to detect overflow; a body
+that is larger, or declares a larger `Content-Length`, is dropped before it is decoded or parsed,
+and that turn gets no pointers. Only
 `slug`, `title` and `source_id` are kept; every other field, including the `chunk_text` fragment,
 is discarded when the response is parsed and is never shown to the model, logged or stored.
 

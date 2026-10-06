@@ -49,9 +49,9 @@ and the plugin never writes to GBrain.
     fields present). Only `slug`, `title` and `source_id` are kept; the rest is discarded in
     memory and never shown to the model, logged or stored. Rows GBrain marks
     `injection_suspected: true` are skipped entirely; clean rows after them still fill the limit.
-  - Response bodies are read up to 16,384 bytes (`/token`) and 262,144 bytes (search). A larger
-    body, or a larger declared `Content-Length`, is dropped before decoding or parsing, and the
-    turn gets no pointers.
+  - Response bodies are accepted up to 16,384 bytes (`/token`) and 262,144 bytes (search); the
+    reader consumes at most one extra byte to detect overflow. A larger body, or a larger declared
+    `Content-Length`, is dropped before decoding or parsing, and the turn gets no pointers.
   - Redirects are never followed on either request, so credentials are not forwarded to another
     origin or downgraded to `http`.
   - No assistant text, tool output, files or message history is sent. Plain `http` to a
