@@ -12,11 +12,18 @@ Design rules:
   Any error (network, auth, malformed payload) yields no context, never an exception.
 * Profile-safe. Credentials and settings are read through
   ``agent.secret_scope.get_secret`` on the caller's thread, so the multiplexed
-  gateway's per-profile scope is honoured. Minted tokens, cached pointers and
-  in-flight work are keyed by the active profile home plus a keyed hash of the
-  credential (never the credential itself), so another profile, or the same profile
-  after its credential changes, can never reuse them. A routed task with no profile
+  gateway's per-profile scope is honoured. A call serving a routed profile must
+  have a bound secret scope: a home override alone says whose turn it is, not whose
+  credentials the process environment holds, so without a scope nothing is read.
+  Minted tokens and cached pointers are keyed by the active profile home plus a
+  keyed hash of the credential (never the credential itself), so another profile, or
+  the same profile after its credential changes, can never reuse them; in-flight
+  work is tracked per profile home and session. A routed task with no profile
   identity is refused. Nothing is written to ``os.environ``.
+* Bounded input. Token and search response bodies are read up to a fixed byte limit;
+  a larger (or larger-declared) body is a failure before it is decoded or parsed.
+* Flagged rows are dropped. A row GBrain marks ``injection_suspected: true`` never
+  becomes a pointer.
 * Credentials stay with their origin. Redirects are never followed on the token or
   MCP request, so a 3xx answer is a failure, not a hop to another host.
 * Lifecycle-safe. Reset/rewind bump a per-(profile, session) generation and shutdown
@@ -63,6 +70,11 @@ MAX_TITLE_CHARS = 160
 MINT_TIMEOUT_S = 3.0
 SEARCH_TIMEOUT_S = 12.0
 MCP_PROTOCOL_VERSION = "2025-03-26"
+# Response body limits. A /token answer is one small JSON object; a search answer is
+# at most MAX_LIMIT lean rows with 1-character snippets plus GBrain's metadata. A body
+# over the limit (or declaring one) is a failure: no pointers for that turn.
+MAX_TOKEN_RESPONSE_BYTES = 16 * 1024
+MAX_SEARCH_RESPONSE_BYTES = 256 * 1024
 # Smallest chunk-text cap GBrain honours; 0 would mean full text (see _fetch_pointers).
 SNIPPET_CHARS = 1
 _DEFAULT_SESSION = "__default__"
@@ -194,6 +206,35 @@ def _profile_identity() -> Tuple[str, str]:
         return "", missing
 
 
+def _credential_scope_error() -> str:
+    """Error string when this call serves a routed profile without a bound secret scope, else ''.
+
+    Never raises. Hermes' ``get_secret`` falls back to ``os.environ`` when no scope is
+    bound and the process is not multiplexing, even if a context-local home override
+    names another profile. Those process-env values belong to the launch profile, so a
+    routed call must carry its own scope before any credential is read.
+    """
+    refused = ("this call serves a routed Hermes profile but has no bound credential scope; "
+               "refusing to use the launch profile's environment")
+    try:
+        from agent import secret_scope as _ss
+    except ImportError:  # pragma: no cover - Hermes without secret scopes: single profile
+        return ""
+    try:
+        if hasattr(_ss, "serves_routed_profile"):
+            routed = bool(_ss.serves_routed_profile())
+        else:  # pragma: no cover - older Hermes
+            routed = bool(getattr(_ss, "is_multiplex_active", lambda: False)())
+        if not routed:
+            return ""
+        current = getattr(_ss, "current_secret_scope", None)
+        if current is None or current() is None:
+            return refused
+        return ""
+    except Exception:
+        return refused
+
+
 def derive_token_url(mcp_url: str) -> str:
     """``http://host:3131/mcp`` -> ``http://host:3131/token`` (GBrain serves /token at the root
     of the same origin; a path prefix in front of ``/mcp`` is kept)."""
@@ -239,6 +280,11 @@ def _parse_limit(raw: str) -> int:
 
 def read_settings() -> Settings:
     """Read all settings from the active scope. Must run on the caller's thread. Never raises."""
+    scope_error = _credential_scope_error()
+    if scope_error:
+        # Read nothing: every profile variable would come from the launch profile's env.
+        return Settings(mcp_url="", token_url="", access_token="", client_id="", client_secret="",
+                        source="", limit=DEFAULT_LIMIT, url_error="", identity_error=scope_error)
     mcp_url = _read_env(ENV_URL) or DEFAULT_MCP_URL
     allow_http = _read_env(ENV_ALLOW_HTTP).lower() in ("1", "true", "yes", "on")
     url_error = _check_url(mcp_url, allow_http)
@@ -277,6 +323,38 @@ class _RefuseRedirects(urllib.request.HTTPRedirectHandler):
 _OPENER = urllib.request.build_opener(_RefuseRedirects())
 
 
+class ResponseTooLarge(ValueError):
+    """A response body exceeded (or declared more than) its byte limit."""
+
+
+def _read_bounded(response: Any, limit: int) -> bytes:
+    """Read at most ``limit + 1`` bytes of *response*; raise ResponseTooLarge past ``limit``.
+
+    A declared ``Content-Length`` over the limit fails before anything is read. The
+    header is never trusted to bound the read: the loop asks only for the bytes still
+    allowed, so an absent or understated length cannot make it read more.
+    """
+    headers = getattr(response, "headers", None)
+    declared = headers.get("Content-Length") if headers is not None else None
+    try:
+        declared_bytes = int(str(declared).strip()) if declared is not None else None
+    except ValueError:
+        declared_bytes = None  # unparseable: rely on the bounded read below
+    if declared_bytes is not None and declared_bytes > limit:
+        raise ResponseTooLarge(f"declared body over {limit} bytes")
+    chunks: List[bytes] = []
+    received = 0
+    while received <= limit:
+        chunk = response.read(limit + 1 - received)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        received += len(chunk)
+    if received > limit:
+        raise ResponseTooLarge(f"body over {limit} bytes")
+    return b"".join(chunks)
+
+
 def _spawn(target: Callable[[], None], name: str) -> threading.Thread:
     if _spawn_context_thread is not None:
         return _spawn_context_thread(target, name=name)
@@ -309,34 +387,49 @@ def _extract_envelope(raw: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-def format_pointers(raw: str, limit: int) -> Tuple[str, int]:
-    """Turn a ``tools/call search`` response body into (context block, pointer count).
+def _injection_suspected(item: Dict[str, Any]) -> bool:
+    """True when GBrain flagged the row as a suspected prompt injection."""
+    flag = item.get("injection_suspected")
+    return flag is True or (isinstance(flag, str) and flag.strip().lower() == "true")
 
-    Anything unexpected returns ("", 0).
+
+def _render(lines: List[str], limit: int) -> Tuple[str, int]:
+    lines = list(lines)[:max(0, limit)]
+    if not lines:
+        return "", 0
+    return POINTER_HEADER + "\n" + "\n".join(lines), len(lines)
+
+
+def pointer_lines(raw: str, limit: int) -> List[str]:
+    """Turn a ``tools/call search`` response body into up to *limit* pointer lines.
+
+    Rows GBrain flags ``injection_suspected`` are skipped before deduplication and
+    counting, so clean rows behind them still fill the limit. Anything unexpected
+    returns [].
     """
     envelope = _extract_envelope(raw)
     if not envelope or not isinstance(envelope.get("result"), dict):
-        return "", 0
+        return []
     result = envelope["result"]
     if result.get("isError"):
-        return "", 0
+        return []
     content = result.get("content")
     if not isinstance(content, list) or not content or not isinstance(content[0], dict):
-        return "", 0
+        return []
     try:
         items = json.loads(content[0].get("text") or "[]")
     except (TypeError, ValueError):
-        return "", 0
+        return []
     if isinstance(items, dict) and isinstance(items.get("results"), list):
         items = items["results"]
     if not isinstance(items, list):
-        return "", 0
+        return []
     lines: List[str] = []
     seen = set()
     for item in items:
         if len(lines) >= limit:
             break
-        if not isinstance(item, dict):
+        if not isinstance(item, dict) or _injection_suspected(item):
             continue
         slug = _one_line(item.get("slug") or item.get("id"), MAX_TITLE_CHARS)
         if not slug:
@@ -347,9 +440,12 @@ def format_pointers(raw: str, limit: int) -> Tuple[str, int]:
         seen.add((source, slug))
         title = _one_line(item.get("title"), MAX_TITLE_CHARS) or slug
         lines.append(f"- [{source}:{slug}] {title}")
-    if not lines:
-        return "", 0
-    return POINTER_HEADER + "\n" + "\n".join(lines), len(lines)
+    return lines
+
+
+def format_pointers(raw: str, limit: int) -> Tuple[str, int]:
+    """(context block, pointer count) for a search response body; ("", 0) when empty."""
+    return _render(pointer_lines(raw, limit), limit)
 
 
 class GBrainPointerMemoryProvider(MemoryProvider):
@@ -361,9 +457,12 @@ class GBrainPointerMemoryProvider(MemoryProvider):
         # Per-instance key for credential fingerprints: the hashes never leave this
         # object and cannot be compared across processes or brute-forced offline.
         self._fp_key = os.urandom(32)
-        # (home_key, session) -> (settings fingerprint, context block, count)
-        self._cached: Dict[Tuple[str, str], Tuple[str, str, int]] = {}
-        # (home_key, session) -> (generation, job) of the one search in flight
+        # (home_key, session) -> (settings fingerprint, pointer lines). Rendered on
+        # consumption, so the consuming call's limit always applies.
+        self._cached: Dict[Tuple[str, str], Tuple[str, Tuple[str, ...]]] = {}
+        # (home_key, session) -> (generation, job) of the current-generation search.
+        # Reset/rewind drop the entry without stopping that worker; it may finish its
+        # request but cannot publish (see _is_current).
         self._inflight: Dict[Tuple[str, str], Tuple[int, object]] = {}
         # (home_key, session) -> generation; bumped by reset/rewind
         self._generation: Dict[Tuple[str, str], int] = {}
@@ -476,7 +575,8 @@ class GBrainPointerMemoryProvider(MemoryProvider):
             method="POST",
         )
         with _OPENER.open(request, timeout=MINT_TIMEOUT_S) as response:
-            payload = json.loads(response.read().decode("utf-8", errors="replace") or "{}")
+            raw = _read_bounded(response, MAX_TOKEN_RESPONSE_BYTES)
+        payload = json.loads(raw.decode("utf-8", errors="replace") or "{}")
         token = str(payload.get("access_token") or "") if isinstance(payload, dict) else ""
         if token:
             with self._lock:
@@ -502,15 +602,16 @@ class GBrainPointerMemoryProvider(MemoryProvider):
             method="POST",
         )
         with _OPENER.open(request, timeout=SEARCH_TIMEOUT_S) as response:
-            return response.read().decode("utf-8", errors="replace")
+            raw = _read_bounded(response, MAX_SEARCH_RESPONSE_BYTES)
+        return raw.decode("utf-8", errors="replace")
 
-    def _fetch_pointers(self, query: str, settings: Settings, epoch: Optional[int] = None) -> Tuple[str, int]:
+    def _fetch_pointers(self, query: str, settings: Settings, epoch: Optional[int] = None) -> List[str]:
         if not settings.usable:
-            return "", 0
+            return []
         # GBrain has no metadata-only search mode: ``snippet_chars`` <= 0 means FULL
         # chunk text. 1 is the smallest cap it honours (one character plus a
         # truncation marker); ``fields: lean`` pins the compact row shape. Everything
-        # except slug, title and source id is discarded in format_pointers.
+        # except slug, title and source id is discarded in pointer_lines.
         arguments: Dict[str, Any] = {
             "query": query[:MAX_QUERY_CHARS],
             "limit": settings.limit,
@@ -534,27 +635,27 @@ class GBrainPointerMemoryProvider(MemoryProvider):
                 token = self._minted.get(self._mint_key(settings), "")
             token = token or self._mint_token(settings, epoch)
         if not token:
-            return "", 0
+            return []
         try:
             raw = self._search(settings, token, payload)
         except urllib.error.HTTPError as exc:  # includes a refused 3xx redirect
             code = exc.code
             exc.close()
             if code != 401 or bearer:
-                return "", 0
+                return []
             # Expired or revoked minted token: re-mint once, then give up for this turn.
             with self._lock:
                 if self._minted.get(self._mint_key(settings)) == token:
                     self._minted.pop(self._mint_key(settings), None)
             token = self._mint_token(settings, epoch)
             if not token:
-                return "", 0
+                return []
             try:
                 raw = self._search(settings, token, payload)
             except urllib.error.HTTPError as retry_exc:
                 retry_exc.close()
-                return "", 0
-        return format_pointers(raw, settings.limit)
+                return []
+        return pointer_lines(raw, settings.limit)
 
     # -- recall lifecycle --------------------------------------------------
 
@@ -578,9 +679,10 @@ class GBrainPointerMemoryProvider(MemoryProvider):
                     return ""
                 # One-shot per (profile, session): consuming the result keeps pointers
                 # from leaking into later turns, another conversation or another profile.
-                cached_fp, text, count = self._cached.pop(key, ("", "", 0))
-            if not text or not hmac.compare_digest(cached_fp, fingerprint):
+                cached_fp, lines = self._cached.pop(key, ("", ()))
+            if not lines or not hmac.compare_digest(cached_fp, fingerprint):
                 return ""  # nothing cached, or fetched under different settings/credentials
+            text, count = _render(lines, settings.limit)  # this call's limit, not the fetch's
             self._last_count = count
             return text
         except Exception as exc:  # pragma: no cover - fail open
@@ -614,17 +716,17 @@ class GBrainPointerMemoryProvider(MemoryProvider):
 
         def _run() -> None:
             try:
-                text, count = self._fetch_pointers(query, settings, epoch)
-            except Exception as exc:  # fail open; never log the prompt
+                lines = self._fetch_pointers(query, settings, epoch)
+            except Exception as exc:  # fail open (incl. ResponseTooLarge); never log the prompt
                 logger.debug("gbrain-pointer prefetch failed: %s", type(exc).__name__)
-                text, count = "", 0
+                lines = []
             with self._lock:
                 if self._inflight.get(key, (None, None))[1] is job:
                     del self._inflight[key]
                 if not self._is_current(key, generation, epoch):
                     return  # reset, rewound or shut down meanwhile: publish nothing
-                if text:
-                    self._cached[key] = (fingerprint, text, count)
+                if lines:
+                    self._cached[key] = (fingerprint, tuple(lines))
                 else:
                     self._cached.pop(key, None)
 
