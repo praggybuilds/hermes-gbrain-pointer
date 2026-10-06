@@ -62,7 +62,8 @@ heuristic, and the titles of unflagged rows still reach the model as untrusted t
 
 Nothing else leaves the machine. It sends no assistant text, tool output, files or telemetry, and
 no third-party service is contacted. Redirects are never followed: a `3xx` answer from the token or
-MCP endpoint counts as a failure, so credentials are only ever sent to the configured origin. The
+MCP endpoint counts as a failure. Proxy settings (`http_proxy`, `https_proxy`, the system proxy)
+are ignored, so credentials are only ever sent to the configured origin. The
 default endpoint is loopback (`http://127.0.0.1:3131/mcp`). Plain `http` to any other host is
 refused unless you set `GBRAIN_POINTER_ALLOW_HTTP=1`.
 
@@ -134,9 +135,6 @@ values.
 | `GBRAIN_POINTER_ALLOW_HTTP` | no | off | `1` allows plain `http` to a host that is not loopback |
 
 \* Set either the client id and secret, or an access token.
-
-`GBRAIN_SHARED_MCP_CLIENT_ID`, `GBRAIN_SHARED_MCP_CLIENT_SECRET` and
-`GBRAIN_SHARED_MCP_ACCESS_TOKEN` are still read as older names for the same settings.
 
 ## Privacy and security
 

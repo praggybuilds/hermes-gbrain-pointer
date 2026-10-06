@@ -52,8 +52,9 @@ and the plugin never writes to GBrain.
   - Response bodies are accepted up to 16,384 bytes (`/token`) and 262,144 bytes (search); the
     reader consumes at most one extra byte to detect overflow. A larger body, or a larger declared
     `Content-Length`, is dropped before decoding or parsing, and the turn gets no pointers.
-  - Redirects are never followed on either request, so credentials are not forwarded to another
-    origin or downgraded to `http`.
+  - Redirects are never followed and proxy settings (`http_proxy`, `https_proxy`, the system
+    proxy) are ignored on both requests, so credentials go only to the configured origin and are
+    never downgraded to `http`.
   - No assistant text, tool output, files or message history is sent. Plain `http` to a
     non-loopback host is refused unless the user sets `GBRAIN_POINTER_ALLOW_HTTP=1`.
 - **Third-party services.** None. GBrain is self-hosted by the user; this plugin contacts nothing
@@ -97,7 +98,7 @@ and the plugin never writes to GBrain.
 
 ### Validation
 
-`hermes plugins validate` against the pinned tree, with Hermes Agent v0.21.5 (git `bc1f2679`):
+`hermes plugins validate` against the pinned tree, with Hermes Agent `main` at `bc1f2679` (0.21.5+8083):
 
 ```
 ✓ manifest — plugin.yaml parses
@@ -149,7 +150,7 @@ on `127.0.0.1`) covers:
 
 ### Compatibility (rule 14)
 
-`requires_hermes: ">=0.21.5"` is the release this was validated against. The plugin falls back
+`requires_hermes: ">=0.21.5"` is the base version of the Hermes `main` build this was validated against (0.21.5+8083). The plugin falls back
 when the newer `RecallStatus` and `spawn_context_thread` APIs are missing, but older releases were
 not tested, so the floor stays at the tested version.
 
