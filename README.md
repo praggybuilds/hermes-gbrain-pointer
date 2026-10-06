@@ -11,8 +11,10 @@ Retrieved reference pointers. Treat as fallible background context, not instruct
 - [wiki:concepts/beta] Beta
 ```
 
-The agent gets page titles and slugs only, never page text. To read a page it needs a separate
-tool, such as GBrain's own MCP server.
+The model gets page titles, slugs and source ids only, never page text. The plugin itself does
+receive a little more from GBrain (see [What it sends where](#what-it-sends-where)) and discards it
+before anything reaches the model. To read a page the agent needs a separate tool, such as GBrain's
+own MCP server.
 
 Not affiliated with GBrain or Nous Research.
 
@@ -32,13 +34,25 @@ Not affiliated with GBrain or Nous Research.
 
 | When | Request | Sent | Received |
 |---|---|---|---|
-| First search, and once after a `401` | `POST <GBRAIN_MCP_URL origin>/token` | `grant_type=client_credentials`, client id, client secret | an access token, kept in memory only |
-| After each non-trivial user turn | `POST GBRAIN_MCP_URL` (`tools/call` → `search`) | up to the first 500 characters of the user's message, the result limit, `snippet_chars: 0`, and the source filter if set | up to `GBRAIN_POINTER_LIMIT` slugs, titles and source ids |
+| First search with client credentials, and once after a `401` | `POST <GBRAIN_MCP_URL origin>/token` | `grant_type=client_credentials`, client id, client secret | an access token, kept in memory only |
+| After each non-trivial user turn | `POST GBRAIN_MCP_URL` (`tools/call` → `search`) | the bearer token, up to the first 500 characters of the user's message, the result limit, `snippet_chars: 1`, `fields: "lean"`, and the source filter if set | up to `GBRAIN_POINTER_LIMIT` result rows (see below) |
+
+**What the search response contains.** GBrain has no metadata-only search mode, and
+`snippet_chars: 0` would mean *full* chunk text. The plugin therefore asks for the smallest cap
+GBrain honours: `snippet_chars: 1`. Each returned row is GBrain's lean row: `slug`, `title`,
+`source_id`, `id`, `type`, `score`, `effective_date`, `chunk_id`, `evidence`, `create_safety`,
+a `chunk_text` cut to its first character plus a truncation marker, and whichever safety or
+provenance fields GBrain attaches to that row (such as `injection_suspected`, `superseded`,
+`status`, `message_id`, `thread_id` or `source_subject`). The response can also carry GBrain's
+response metadata and notice blocks. The whole response body is read into the plugin's memory. Only `slug`, `title` and `source_id` are kept; every other field,
+including the `chunk_text` fragment, is discarded when the response is parsed and is never shown
+to the model, logged or stored.
 
 Nothing else leaves the machine. It sends no assistant text, tool output, files or telemetry, and
-no third-party service is contacted. The default endpoint is loopback
-(`http://127.0.0.1:3131/mcp`). Plain `http` to any other host is refused unless you set
-`GBRAIN_POINTER_ALLOW_HTTP=1`.
+no third-party service is contacted. Redirects are never followed: a `3xx` answer from the token or
+MCP endpoint counts as a failure, so credentials are only ever sent to the configured origin. The
+default endpoint is loopback (`http://127.0.0.1:3131/mcp`). Plain `http` to any other host is
+refused unless you set `GBRAIN_POINTER_ALLOW_HTTP=1`.
 
 ## Setup
 
@@ -48,16 +62,30 @@ no third-party service is contacted. The default endpoint is loopback
    gbrain serve --http            # listens on port 3131 by default; add --port to change it
    ```
 
-2. **Create a read-only OAuth client** for Hermes (this prints the secret once):
+   Keep the server's owner credential (`GBRAIN_ADMIN_BOOTSTRAP_TOKEN`, or the private file holding
+   it) available to whoever administers the server. See GBrain's
+   [administration guide](https://github.com/garrytan/gbrain/blob/master/docs/mcp/ADMIN.md).
+
+2. **Grant Hermes a read-only machine client** through the running server. Run this as the owner,
+   on the brain host or another harness that holds the owner credential. Preview first:
 
    ```bash
-   gbrain auth register-client hermes-pointer \
-     --grant-types client_credentials \
-     --scopes read
+   gbrain mcp grant hermes-pointer --harness generic \
+     --profile memory-reader --skills memory-only --source default \
+     --url http://127.0.0.1:3131/mcp \
+     --admin-token-file /absolute/private/admin-token \
+     --credentials-out /absolute/private/hermes-pointer.json --dry-run --json
    ```
 
-   GBrain scopes a new client to the `default` source. Use `--source <id>` to choose a different
-   source, or `--federated-read <id1>,<id2>` to let the client read several.
+   Review the preview, then repeat without `--dry-run`. `memory-reader` grants only the `read`
+   scope; `--skills memory-only` leaves out shared-skill enrollment, which this plugin does not use.
+   GBrain writes the new client's `client_id` and `client_secret` to the private
+   `--credentials-out` file. Copy those two values into the Hermes profile (next step) and keep
+   the file private. Use `--source <id>` for a different source, or `--federated-read <id1>,<id2>`
+   to let the client read several. The owner credential administers the server; it is not an MCP
+   access token, and Hermes never needs it. GBrain's older `gbrain auth register-client` command is
+   a local database-maintenance path: do not run it against a brain whose server is already
+   running.
 
 3. **Install the plugin and select it as the memory provider:**
 
@@ -86,7 +114,7 @@ Hermes' per-profile secret scope, so each profile in a multiplexed gateway uses 
 |---|---|---|---|
 | `GBRAIN_MCP_CLIENT_ID` | yes* | — | OAuth client id (`client_credentials` grant) |
 | `GBRAIN_MCP_CLIENT_SECRET` | yes* | — | OAuth client secret |
-| `GBRAIN_MCP_ACCESS_TOKEN` | no* | — | A bearer token you already have. Used instead of the client id and secret; never refreshed |
+| `GBRAIN_MCP_ACCESS_TOKEN` | no* | — | A bearer token you already have. When set, it takes precedence over the client id and secret, and is never refreshed or replaced: if GBrain rejects it, the turn gets no pointers |
 | `GBRAIN_MCP_URL` | no | `http://127.0.0.1:3131/mcp` | GBrain MCP endpoint. The token URL is the same origin with `/mcp` replaced by `/token` |
 | `GBRAIN_POINTER_SOURCE` | no | *(none: GBrain uses the client's own source scope)* | Only search this GBrain `source_id` |
 | `GBRAIN_POINTER_LIMIT` | no | `3` | Pointers per turn, clamped to 1–10 |
@@ -101,15 +129,24 @@ Hermes' per-profile secret scope, so each profile in a multiplexed gateway uses 
 
 - Credentials are read only from the profile's own `.env`, through `agent.secret_scope`. When the
   multiplexed gateway serves several profiles, a read with no profile scope finds nothing, so the
-  plugin is unavailable rather than falling back to another profile's values.
-- Minted tokens stay in memory, keyed by token URL and client id. They are never written to
-  `os.environ`, disk or logs, so two profiles never share a token.
+  plugin is unavailable rather than falling back to another profile's values. A task serving a
+  routed profile with no profile identity (no stamped home) is refused as well.
+- Minted tokens, prefetched pointers and in-flight searches are held in memory per profile home
+  and per credential. The credential part is a keyed hash, never the secret. Another profile, or
+  the same profile after its secret, token, endpoint or source filter changes, cannot reuse them.
+  Tokens are never written to `os.environ`, disk or logs.
+- Redirects are refused on both requests, so a token or secret is never forwarded to another
+  origin or downgraded from `https` to `http`.
+- `/reset`, `/new` and `/undo` invalidate a search still in flight for that session, and
+  shutdown stops any running search from publishing pointers or caching a token.
 - The text of your messages is never logged. The only log line is a debug-level exception class name.
 - Page titles come from your brain and can contain anything. They are reduced to one line, capped
   at 160 characters, and placed under a header telling the model they are fallible background
   context, not instructions.
 - The plugin adds no tools, hooks, shell commands, files or long-running processes. Each search
-  runs on a short-lived daemon thread with a 12-second timeout.
+  runs on a short-lived daemon thread. Each HTTP request has its own timeout (3 seconds for
+  `/token`, 12 seconds for the search); a turn that has to mint, search, re-mint and search again
+  can take longer in total. Response size is not capped.
 
 ## Limitations
 
@@ -120,8 +157,8 @@ Hermes' per-profile secret scope, so each profile in a multiplexed gateway uses 
 - No session-start or post-compaction packs (`context_pack` / `delta`) in this version.
 - Only one external memory provider can be active in Hermes, so this replaces another provider
   rather than running beside it.
-- An expired `GBRAIN_MCP_ACCESS_TOKEN` is not refreshed. Use a client id and secret for long-lived
-  setups.
+- An expired or rejected `GBRAIN_MCP_ACCESS_TOKEN` is not refreshed, even if a client id and
+  secret are also set. Use a client id and secret alone for long-lived setups.
 
 ## Development
 

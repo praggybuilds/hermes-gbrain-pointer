@@ -95,6 +95,14 @@ class StubGBrain:
         self.mint_count = 0
         self.search_calls: List[Dict[str, Any]] = []  # {"token", "client", "arguments"}
         self.items: Any = SAMPLE_RESULTS
+        self.static_ok = True                     # does "static-token" authenticate?
+        self.redirect_mcp: Optional[str] = None   # answer POST /mcp with 302 -> this URL
+        self.redirect_token: Optional[str] = None # answer POST /token with 302 -> this URL
+        self.any_requests: List[Dict[str, str]] = []  # every request, any method/path
+        # query -> (entered, release): hold that query's /mcp response until released.
+        self.gates: Dict[str, Any] = {}
+        self.token_gate: Optional[Any] = None     # (entered, release) for /token
+        self.title_from_query = False             # title = the query (tells jobs apart)
         stub = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -109,9 +117,29 @@ class StubGBrain:
                 self.end_headers()
                 self.wfile.write(data)
 
+            def _record(self) -> None:
+                with stub.lock:
+                    stub.any_requests.append({"method": self.command, "path": self.path,
+                                              "auth": self.headers.get("Authorization", "")})
+
+            def _redirect(self, status: int, location: str) -> None:
+                self.send_response(status)
+                self.send_header("Location", location)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def do_GET(self):
+                self._record()
+                self._send(404, "{}", "application/json")
+
             def do_POST(self):
+                self._record()
                 length = int(self.headers.get("Content-Length") or 0)
                 raw = self.rfile.read(length).decode("utf-8")
+                if self.path == "/token" and stub.redirect_token:
+                    return self._redirect(302, stub.redirect_token)
+                if self.path == "/mcp" and stub.redirect_mcp:
+                    return self._redirect(302, stub.redirect_mcp)
                 if self.path == "/token":
                     return self._token(raw)
                 if self.path == "/mcp":
@@ -119,6 +147,10 @@ class StubGBrain:
                 self._send(404, "{}", "application/json")
 
             def _token(self, raw: str) -> None:
+                if stub.token_gate is not None:
+                    entered, release = stub.token_gate
+                    entered.set()
+                    release.wait(10)
                 form = dict(urllib.parse.parse_qsl(raw))
                 with stub.lock:
                     stub.mint_count += 1
@@ -139,20 +171,35 @@ class StubGBrain:
                 auth = self.headers.get("Authorization", "")
                 token = auth[len("Bearer "):] if auth.startswith("Bearer ") else ""
                 payload = json.loads(raw)
+                query = payload.get("params", {}).get("arguments", {}).get("query", "")
+                gate = stub.gates.get(query)
+                if gate is not None:
+                    entered, release = gate
+                    entered.set()
+                    release.wait(10)
                 with stub.lock:
                     stub.search_calls.append({
                         "token": token, "client": stub.tokens.get(token),
                         "arguments": payload.get("params", {}).get("arguments", {}),
                         "method": payload.get("method"), "tool": payload.get("params", {}).get("name"),
                     })
-                    known = token in stub.tokens or token == "static-token"
+                    known = token in stub.tokens or (token == "static-token" and stub.static_ok)
                     unauthorized = stub.always_401 or not known or token in stub.expired
                     status, body = stub.mcp_status, stub.mcp_body
                 if unauthorized:
                     return self._send(401, json.dumps({"error": "invalid_token"}), "application/json")
                 if status != 200:
                     return self._send(status, "upstream error", "text/plain")
-                self._send(200, body if body is not None else search_body(stub.items), "text/event-stream")
+                items = stub.items
+                if stub.title_from_query:
+                    items = [{"slug": "q/result", "title": query, "source_id": "docs"}]
+                # GBrain semantics: snippet_chars <= 0 (or absent) means FULL chunk text.
+                cap = payload.get("params", {}).get("arguments", {}).get("snippet_chars")
+                if isinstance(items, list) and isinstance(cap, int) and cap > 0:
+                    items = [dict(i, chunk_text=i["chunk_text"][:cap] + "… [truncated]")
+                             if isinstance(i, dict) and isinstance(i.get("chunk_text"), str) and len(i["chunk_text"]) > cap
+                             else i for i in items]
+                self._send(200, body if body is not None else search_body(items), "text/event-stream")
 
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -173,14 +220,50 @@ def scope(secrets: Dict[str, str], home: str = ""):
         secret_scope.reset_secret_scope(token)
 
 
+def _inflight_sessions(provider) -> set:
+    with provider._lock:
+        keys = list(provider._inflight)
+    return {k[-1] if isinstance(k, tuple) else k for k in keys}
+
+
 def wait_idle(provider, key: str, timeout: float = 10.0) -> None:
     deadline = time.time() + timeout
     while time.time() < deadline:
-        with provider._lock:
-            if key not in provider._inflight:
-                return
+        if key not in _inflight_sessions(provider):
+            return
         time.sleep(0.02)
     raise AssertionError("background prefetch did not finish")
+
+
+@contextmanager
+def captured_workers():
+    """Record every background worker thread the provider starts, so a test can join them."""
+    threads: List[threading.Thread] = []
+    original = gp._spawn
+
+    def spy(target, name):
+        thread = original(target, name=name)
+        threads.append(thread)
+        return thread
+
+    gp._spawn = spy
+    try:
+        yield threads
+    finally:
+        gp._spawn = original
+
+
+def join_all(threads, timeout: float = 10.0) -> None:
+    for thread in threads:
+        thread.join(timeout)
+        if thread.is_alive():
+            raise AssertionError("worker did not finish")
+
+
+def gate(stub, query: str):
+    entered, release = threading.Event(), threading.Event()
+    stub.gates[query] = (entered, release)
+    return entered, release
 
 
 def run_turn(provider, query: str, session: str = "s1") -> str:
@@ -287,7 +370,8 @@ class GBrainPointerTests(unittest.TestCase):
         self.assertIsNone(self.provider.recall_status())
         call = self.stub.search_calls[0]
         self.assertEqual((call["method"], call["tool"]), ("tools/call", "search"))
-        self.assertEqual(call["arguments"], {"query": "what is the alpha project status?", "limit": 3, "snippet_chars": 0})
+        self.assertEqual(call["arguments"], {"query": "what is the alpha project status?", "limit": 3,
+                                             "snippet_chars": 1, "fields": "lean"})
 
     def test_source_filter_and_limit_are_configurable(self):
         with scope(dict(self.creds_a, GBRAIN_POINTER_SOURCE="docs", GBRAIN_POINTER_LIMIT="2")):
@@ -457,6 +541,266 @@ class GBrainPointerTests(unittest.TestCase):
         pointer = text.splitlines()[1]
         self.assertEqual(len(text.splitlines()), 2)
         self.assertLessEqual(len(pointer), gp.MAX_TITLE_CHARS + 20)
+
+
+class ReviewFindingTests(unittest.TestCase):
+    """Regression tests for the eight findings of the first independent review (RED before the fix)."""
+
+    setUp = GBrainPointerTests.setUp
+    tearDown = GBrainPointerTests.tearDown
+
+    def make_home(self) -> str:
+        home = tempfile.mkdtemp(prefix="gbrain-pointer-profile-")
+        self.addCleanup(shutil.rmtree, home, True)
+        return home
+
+    def second_stub(self) -> "StubGBrain":
+        other = StubGBrain()
+        self.addCleanup(other.close)
+        return other
+
+    # -- 1. profile isolation ----------------------------------------------
+
+    def test_f1_other_profile_same_client_id_wrong_secret_gets_nothing(self):
+        home_a, home_b = self.make_home(), self.make_home()
+        with scope(self.creds_a, home=home_a):
+            self.assertTrue(run_turn(self.provider, "alpha project status", session="s"))
+        self.assertEqual(self.stub.mint_count, 1)
+        with scope(dict(self.creds_a, GBRAIN_MCP_CLIENT_SECRET="wrong"), home=home_b):
+            self.assertEqual(run_turn(self.provider, "alpha project status", session="s"), "")
+        self.assertEqual(self.stub.mint_count, 2, "profile B must mint with its own (rejected) secret")
+        self.assertEqual(len(self.stub.search_calls), 1, "profile A's token must never be presented for B")
+
+    def test_f1_other_profile_cannot_consume_cached_pointers(self):
+        home_a, home_b = self.make_home(), self.make_home()
+        with scope(self.creds_a, home=home_a):
+            self.provider.queue_prefetch("alpha project status", session_id="s")
+            wait_idle(self.provider, "s")
+        with scope({}, home=home_b):
+            self.assertEqual(self.provider.prefetch("alpha project status", session_id="s"), "")
+        with scope(self.creds_a, home=home_b):
+            self.assertEqual(self.provider.prefetch("alpha project status", session_id="s"), "",
+                             "identical credentials in another profile still see nothing")
+        with scope(self.creds_a, home=home_a):
+            self.assertTrue(self.provider.prefetch("alpha project status", session_id="s"))
+
+    def test_f1_changed_or_removed_secret_drops_cached_authority_and_pointers(self):
+        home = self.make_home()
+        with scope(self.creds_a, home=home):
+            self.assertTrue(run_turn(self.provider, "alpha project status"))
+            self.provider.queue_prefetch("alpha project status", session_id="s2")
+            wait_idle(self.provider, "s2")
+        with scope(dict(self.creds_a, GBRAIN_MCP_CLIENT_SECRET="wrong"), home=home):
+            self.assertEqual(self.provider.prefetch("alpha project status", session_id="s2"), "",
+                             "pointers fetched under the old secret are not served under a new one")
+            self.assertEqual(run_turn(self.provider, "alpha project status", session="s3"), "")
+        self.assertEqual(self.stub.mint_count, 2)
+        self.assertEqual(len(self.stub.search_calls), 2)
+        with scope({"GBRAIN_MCP_URL": self.stub.url}, home=home):
+            self.assertEqual(self.provider.prefetch("alpha project status", session_id="s2"), "")
+
+    def test_f1_routed_identity_required_but_absent_fails_closed(self):
+        token = secret_scope.set_multiplex_context(True)
+        try:
+            with scope(self.creds_a):  # a scope with secrets but no profile home stamp
+                self.assertFalse(self.provider.is_available())
+                self.assertIn("profile", self.provider.unavailable_reason())
+                self.provider.queue_prefetch("alpha project status", session_id="s1")
+                self.assertEqual(self.provider.prefetch("alpha project status", session_id="s1"), "")
+            with scope(self.creds_a, home=self.make_home()):
+                self.assertTrue(self.provider.is_available())
+        finally:
+            secret_scope.reset_multiplex_context(token)
+        time.sleep(0.1)
+        self.assertEqual((self.stub.search_calls, self.stub.mint_count), ([], 0))
+
+    # -- 2. inbound data ----------------------------------------------------
+
+    def test_f2_requests_the_smallest_snippet_not_full_text(self):
+        self.stub.items = [dict(SAMPLE_RESULTS[0], chunk_text="secret evidence text " * 20)]
+        with scope(self.creds_a):
+            text = run_turn(self.provider, "alpha project status")
+        args = self.stub.search_calls[0]["arguments"]
+        self.assertGreater(args["snippet_chars"], 0, "GBrain treats snippet_chars <= 0 as FULL text")
+        self.assertLessEqual(args["snippet_chars"], 1)
+        self.assertEqual(args["fields"], "lean")
+        self.assertNotIn("evidence", text)
+
+    def test_f2_readme_discloses_what_is_received(self):
+        readme = (PLUGIN_DIR / "README.md").read_text()
+        table_rows = [line for line in readme.splitlines() if line.startswith("| After each non-trivial")]
+        self.assertEqual(len(table_rows), 1)
+        self.assertIn(f"`snippet_chars: {gp.SNIPPET_CHARS}`", table_rows[0])
+        self.assertNotIn("`snippet_chars: 0`", table_rows[0])
+        self.assertIn("`snippet_chars: 0` would mean *full* chunk text", readme)
+        for word in ("chunk_text", "discarded", "lean row"):
+            self.assertIn(word, readme)
+
+    # -- 3. redirects -------------------------------------------------------
+
+    def test_f3_mcp_redirect_is_refused_and_bearer_not_forwarded(self):
+        other = self.second_stub()
+        self.stub.redirect_mcp = other.url
+        with scope({"GBRAIN_MCP_URL": self.stub.url, "GBRAIN_MCP_ACCESS_TOKEN": "static-token"}):
+            self.assertEqual(run_turn(self.provider, "alpha project status"), "")
+        self.assertEqual(other.any_requests, [], "the redirect target must receive nothing")
+
+    def test_f3_token_redirect_is_refused_and_secret_not_forwarded(self):
+        other = self.second_stub()
+        self.stub.redirect_token = other.url[: -len("/mcp")] + "/token"
+        with scope(self.creds_a):
+            self.assertEqual(run_turn(self.provider, "alpha project status"), "")
+        self.assertEqual(other.any_requests, [])
+        self.assertEqual(self.stub.search_calls, [])
+
+    def test_f3_https_to_http_redirect_is_refused_offline(self):
+        import urllib.request
+        handlers = [h for h in gp._OPENER.handlers if isinstance(h, urllib.request.HTTPRedirectHandler)]
+        self.assertTrue(handlers)
+        request = urllib.request.Request("https://brain.example.com/mcp", data=b"{}", method="POST",
+                                         headers={"Authorization": "Bearer t"})
+        for handler in handlers:
+            for code in (301, 302, 303, 307, 308):
+                self.assertIsNone(handler.redirect_request(
+                    request, io.BytesIO(), code, "Found", {}, "http://untrusted.example/capture"))
+
+    # -- 4. malformed endpoint ---------------------------------------------
+
+    def test_f4_malformed_urls_are_unavailable_and_never_raise(self):
+        bad = ["http://[bad/mcp", "http://127.0.0.1:bad/mcp", "http://127.0.0.1:99999/mcp",
+               "ftp://127.0.0.1/mcp", "http:///mcp", "http://user:pw@127.0.0.1:3131/mcp",
+               "http://127.0.0.1:3131/m cp", "http://127.0.0.1:0/mcp"]
+        for url in bad:
+            with self.subTest(url=url), scope({"GBRAIN_MCP_URL": url, "GBRAIN_MCP_ACCESS_TOKEN": "static-token"}):
+                self.assertFalse(self.provider.is_available())
+                self.assertIn("GBRAIN_MCP_URL", self.provider.unavailable_reason())
+                self.assertIsNone(self.provider.queue_prefetch("alpha project status", session_id="s1"))
+                self.assertEqual(self.provider.prefetch("alpha project status", session_id="s1"), "")
+                self.provider.on_session_switch("s1", reset=True)
+
+    # -- 5. lifecycle races -------------------------------------------------
+
+    def _reset_while_in_flight(self, **switch):
+        entered, release = gate(self.stub, "alpha project status")
+        with captured_workers() as workers, scope(self.creds_a):
+            self.provider.queue_prefetch("alpha project status", session_id="s1")
+            self.assertTrue(entered.wait(10))
+            self.provider.on_session_switch("s1", **switch)
+            release.set()
+            join_all(workers)
+            self.assertEqual(self.provider.prefetch("alpha project status", session_id="s1"), "")
+
+    def test_f5_reset_while_in_flight_does_not_republish(self):
+        self._reset_while_in_flight(reset=True)
+
+    def test_f5_rewind_while_in_flight_does_not_republish(self):
+        self._reset_while_in_flight(rewound=True)
+
+    def test_f5_parent_reset_while_in_flight_does_not_republish(self):
+        entered, release = gate(self.stub, "alpha project status")
+        with captured_workers() as workers, scope(self.creds_a):
+            self.provider.queue_prefetch("alpha project status", session_id="parent")
+            self.assertTrue(entered.wait(10))
+            self.provider.on_session_switch("child", parent_session_id="parent", reset=True)
+            release.set()
+            join_all(workers)
+            self.assertEqual(self.provider.prefetch("alpha project status", session_id="parent"), "")
+
+    def test_f5_replacement_work_after_reset_wins(self):
+        self.stub.title_from_query = True
+        entered, release = gate(self.stub, "old query text")
+        with captured_workers() as workers, scope(self.creds_a):
+            self.provider.queue_prefetch("old query text", session_id="s1")
+            self.assertTrue(entered.wait(10))
+            self.provider.on_session_switch("s1", reset=True)
+            self.provider.queue_prefetch("new query text", session_id="s1")
+            join_all(workers[1:])
+            release.set()
+            join_all(workers)
+            text = self.provider.prefetch("anything else here", session_id="s1")
+        self.assertIn("new query text", text)
+        self.assertNotIn("old query text", text)
+
+    def test_f5_shutdown_blocks_pointer_publication(self):
+        entered, release = gate(self.stub, "alpha project status")
+        with captured_workers() as workers, scope(self.creds_a):
+            self.provider.queue_prefetch("alpha project status", session_id="s1")
+            self.assertTrue(entered.wait(10))
+            self.provider.shutdown()
+            release.set()
+            join_all(workers)
+            self.assertEqual(self.provider.prefetch("alpha project status", session_id="s1"), "")
+            self.provider.initialize("s1")
+            self.assertEqual(self.provider.prefetch("alpha project status", session_id="s1"), "")
+
+    def test_f5_shutdown_blocks_token_caching(self):
+        entered, release = threading.Event(), threading.Event()
+        self.stub.token_gate = (entered, release)
+        with captured_workers() as workers, scope(self.creds_a):
+            self.provider.queue_prefetch("alpha project status", session_id="s1")
+            self.assertTrue(entered.wait(10))
+            self.provider.shutdown()
+            release.set()
+            join_all(workers)
+            self.stub.token_gate = None
+            self.provider.initialize("s2")
+            self.assertTrue(run_turn(self.provider, "alpha project status", session="s2"))
+        self.assertEqual(self.stub.mint_count, 2, "a token minted across shutdown must not be cached")
+
+    def test_f5_queue_after_shutdown_does_nothing(self):
+        self.provider.shutdown()
+        with scope(self.creds_a):
+            self.provider.queue_prefetch("alpha project status", session_id="s1")
+        time.sleep(0.1)
+        self.assertEqual((self.stub.search_calls, self.stub.mint_count), ([], 0))
+
+    # -- 6. auth precedence -------------------------------------------------
+
+    def test_f6_bearer_token_overrides_a_cached_minted_token(self):
+        with scope(self.creds_a):
+            self.assertTrue(run_turn(self.provider, "alpha project status"))
+        with scope(dict(self.creds_a, GBRAIN_MCP_ACCESS_TOKEN="static-token")):
+            self.assertTrue(run_turn(self.provider, "alpha project status", session="s2"))
+        self.assertEqual([c["token"] for c in self.stub.search_calls], ["tok-client-a-1", "static-token"])
+        self.assertEqual(self.stub.mint_count, 1)
+
+    def test_f6_rejected_bearer_never_falls_back_to_minting(self):
+        self.stub.static_ok = False
+        with scope(dict(self.creds_a, GBRAIN_MCP_ACCESS_TOKEN="static-token")):
+            self.assertEqual(run_turn(self.provider, "alpha project status"), "")
+        self.assertEqual(self.stub.mint_count, 0)
+        self.assertEqual([c["token"] for c in self.stub.search_calls], ["static-token"])
+
+    def test_f6_switching_modes_on_one_instance(self):
+        with scope(dict(self.creds_a, GBRAIN_MCP_ACCESS_TOKEN="static-token")):
+            self.assertTrue(run_turn(self.provider, "alpha project status"))
+        with scope(self.creds_a):
+            self.assertTrue(run_turn(self.provider, "alpha project status", session="s2"))
+        with scope({"GBRAIN_MCP_URL": self.stub.url}):
+            self.assertFalse(self.provider.is_available())
+            self.assertEqual(run_turn(self.provider, "alpha project status", session="s3"), "")
+        self.assertEqual([c["token"] for c in self.stub.search_calls], ["static-token", "tok-client-a-1"])
+
+    # -- 7/8. documentation claims ------------------------------------------
+
+    def test_f7_setup_uses_the_running_server_admin_path(self):
+        readme = (PLUGIN_DIR / "README.md").read_text()
+        code = "\n".join(readme.split("```")[1::2])  # fenced code blocks only
+        self.assertNotIn("register-client", code, "the legacy local path must not be a setup command")
+        self.assertIn("gbrain mcp grant", code)
+        self.assertIn("--profile memory-reader", code)
+        self.assertIn("--admin-token-file", code)
+        self.assertNotIn("register-client", (PLUGIN_DIR / "plugin.yaml").read_text())
+
+    def test_f8_drafts_describe_the_configurable_limit(self):
+        drafts = [PLUGIN_DIR / "drafts" / "gbrain-pointer.yaml", PLUGIN_DIR / "drafts" / "catalog-pr-body.md"]
+        drafts = [d for d in drafts if d.exists()]
+        if not drafts:
+            self.skipTest("drafts/ removed before publication")
+        for draft in drafts:
+            text = draft.read_text()
+            self.assertNotIn("up to 3 ", text, draft.name)
+            self.assertIn("3 by default, capped at 10", text, draft.name)
 
 
 class HermesDiscoveryTests(unittest.TestCase):

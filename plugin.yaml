@@ -8,7 +8,7 @@ requires_hermes: ">=0.21.5"
 tags: [memory, gbrain, mcp, recall]
 requires_env:
   - name: GBRAIN_MCP_CLIENT_ID
-    description: "GBrain OAuth client id (client_credentials grant, read scope) from `gbrain auth register-client`"
+    description: "GBrain OAuth client id (client_credentials grant, read scope) from `gbrain mcp grant --profile memory-reader`"
   - name: GBRAIN_MCP_CLIENT_SECRET
     description: "GBrain OAuth client secret for that client"
     secret: true
@@ -16,7 +16,7 @@ optional_env:
   - name: GBRAIN_MCP_URL
     description: "GBrain MCP endpoint (default http://127.0.0.1:3131/mcp)"
   - name: GBRAIN_MCP_ACCESS_TOKEN
-    description: "Pre-minted bearer token, used instead of the client id/secret pair"
+    description: "Pre-minted bearer token; takes precedence over the client id/secret pair and is never refreshed"
     secret: true
   - name: GBRAIN_POINTER_SOURCE
     description: "Restrict search to one GBrain source id (default: no filter)"
