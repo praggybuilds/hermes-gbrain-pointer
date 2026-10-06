@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/praggybuilds/hermes-gbrain-pointer/security/advisories/new
+    about: Report security problems privately, not as a public issue.
+  - name: GBrain bugs
+    url: https://github.com/garrytan/gbrain/issues
+    about: Problems with GBrain itself belong in the GBrain repository.
+  - name: Hermes Agent bugs
+    url: https://github.com/NousResearch/hermes-agent/issues
+    about: Problems with Hermes itself belong in the Hermes repository.
