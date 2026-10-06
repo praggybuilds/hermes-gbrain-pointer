@@ -31,7 +31,8 @@ HERMES_AGENT_SRC=/path/to/hermes-agent python -m unittest discover -s tests -v
 hermes plugins validate .
 ```
 
-CI runs both on every PR (Python 3.14, Hermes `main`).
+CI runs both on every PR (Python 3.14, against a pinned Hermes Agent commit set as `HERMES_REF`
+in `.github/workflows/tests.yml`; it is bumped on purpose in its own PR).
 
 ## Tests
 
@@ -48,8 +49,9 @@ CI runs both on every PR (Python 3.14, Hermes `main`).
 ## How review works
 
 1. CI must pass.
-2. The maintainer agent (`@murphbuilds`, an AI agent) reviews first and posts findings. Larger changes also get an independent review from a second AI model.
-3. The owner (`@praggybuilds`) approves and merges. Only the owner's approval satisfies the branch rule; nothing is auto-merged.
-4. Merged changes reach Hermes users only when the [Hermes plugin catalog](https://github.com/NousResearch/hermes-agent/tree/main/plugin-catalog) entry is re-pinned, which is a separate, reviewed PR.
+2. The maintainer agent (`@murphbuilds`, an AI agent) reviews every PR it did not author and posts findings. Larger changes also get an independent review from a second AI model.
+3. The owner (`@praggybuilds`) approves and merges. Only the owner's approval satisfies the branch rule; nothing is auto-merged. Because GitHub does not let anyone approve their own PR, changes the owner wants made are opened by the maintainer agent for the owner to approve.
+4. Changes to `.github/workflows/` get extra scrutiny: a PR can change its own CI, so reviewers read those hunks line by line.
+5. Merged changes reach Hermes users only when the [Hermes plugin catalog](https://github.com/NousResearch/hermes-agent/tree/main/plugin-catalog) entry is re-pinned, which is a separate, reviewed PR.
 
 By contributing, you agree your contribution is licensed under the [MIT License](LICENSE).
